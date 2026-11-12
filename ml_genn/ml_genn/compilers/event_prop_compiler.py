@@ -17,7 +17,7 @@ from ..callbacks import (BatchProgressBar, Callback, CustomUpdateOnBatchBegin,
 from ..communicators import Communicator
 from ..connection import Connection
 from ..losses import (Loss, MeanSquareError, RelativeMeanSquareError,
-                      SparseCategoricalCrossentropy)
+                      SparseCategoricalCrossentropy, FixationMSEResponseCE)
 from ..metrics import MetricsType
 from ..neurons import (Input, LeakyIntegrate, LeakyIntegrateFire,
                        LeakyIntegrateFireInput)
@@ -625,6 +625,7 @@ class EventPropCompiler(Compiler):
             sce_loss = isinstance(compile_state.losses[pop], SparseCategoricalCrossentropy)
             mse_loss = isinstance(compile_state.losses[pop], MeanSquareError)
             rmse_loss = isinstance(compile_state.losses[pop], RelativeMeanSquareError)
+            combined_loss = isinstance(compile_state.losses[pop], FixationMSEResponseCE)
 
             # Check loss function is compatible
             # **TODO** categorical crossentropy i.e. one-hot encoded
@@ -721,7 +722,7 @@ class EventPropCompiler(Compiler):
                             # Add custom updates to calculate 
                             # softmax from V and write directly to buffermodel_copy
                             compile_state.timestep_softmax_populations.append(
-                                (pop, "V"))
+                                (pop, "V", False))
                             # Add custom update to reset state
                             compile_state.add_neuron_reset_vars(
                                 pop, reset_vars, False, True)
@@ -1442,11 +1443,11 @@ class EventPropCompiler(Compiler):
                                             i, o, "Batch")
 
         # Add per-timestep softmax custom updates for each population that requires them
-        for p, i in enumerate(compile_state.timestep_softmax_populations):
+        for p, i, combined in enumerate(compile_state.timestep_softmax_populations):
             # Create custom update model to implement 
             # first softmax pass and add to model
             genn_pop = neuron_populations[p]
-            self._add_softmax_buffer_custom_updates(genn_model, genn_pop, i)
+            self._add_softmax_buffer_custom_updates(genn_model, genn_pop, i, combined, int(np.prod(p.shape)))
 
         # Loop through connections and add custom updates to zero out post
         for i, genn_syn_pop in enumerate(connection_populations.values()):
@@ -1572,20 +1573,22 @@ class EventPropCompiler(Compiler):
         lower = self.get_lambda(self.reg_lambda_lower, pop)
         return (upper != 0.0) or (lower != 0.0)
 
-    def _add_softmax_buffer_custom_updates(self, genn_model, genn_pop, 
-                                           input_var_name: str):
-        # Create custom update model to implement 
+    def _add_softmax_buffer_custom_updates(self, genn_model, genn_pop,
+                                           input_var_name: str,
+                                           combined: bool = False,
+                                           n_out: int = 0):
+        # Create custom update model to implement
         # first softmax pass and add to model
         softmax_1 = CustomUpdateModel(
             softmax_1_model, {}, {"MaxVal": 0.0},
             {"Val": create_var_ref(genn_pop, input_var_name)})
 
         genn_softmax_1 = self.add_custom_update(
-            genn_model, softmax_1, 
+            genn_model, softmax_1,
             "Softmax1",
             "CUSoftmax1" + genn_pop.name)
 
-        # Create custom update model to implement 
+        # Create custom update model to implement
         # second softmax pass and add to model
         softmax_2 = CustomUpdateModel(
             softmax_2_model, {}, {"SumExpVal": 0.0},
@@ -1593,38 +1596,65 @@ class EventPropCompiler(Compiler):
              "MaxVal": create_var_ref(genn_softmax_1, "MaxVal")})
 
         genn_softmax_2 = self.add_custom_update(
-            genn_model, softmax_2, 
+            genn_model, softmax_2,
             "Softmax2",
             "CUSoftmax2" + genn_pop.name)
 
-        # Create custom update model to implement 
-        # third softmax pass and add to model
+        # Third softmax pass: write per-timestep loss term into ring buffer
+        T = self.example_timesteps
+        if combined:
+            update_code = f"""
+                const int ringOffset = (batch * num_neurons * {2 * T}) + (id * {2 * T});
+                const int step = RingWriteOffset % {T};
+                const int base = ((batch * {T}) + step) * {n_out};
+                scalar rowSum = 0.0;
+                for (int j = 0; j < {n_out}; j++) {{
+                    rowSum += YTrue[base + j];
+                }}
+                const scalar target = YTrue[base + id];
+                const scalar sm = exp(Val - MaxVal) / SumExpVal;
+                scalar g = 0.0;
+                if (rowSum >= 0.5) {{          // response: cross-entropy (weighted)
+                    g = target - rowSum * sm;
+                }}
+                else if (rowSum > -0.5) {{     // fixation: MSE towards zero
+                    g = 2.0 * (target - Val);
+                }}                             // padding: g stays 0
+                RingOutputLossTerm[ringOffset + RingWriteOffset] = g;
+                RingWriteOffset++;
+                """
+            egp_refs = [("RingOutputLossTerm", "scalar*"), ("YTrue", "scalar*")]
+            egp_vals = {"RingOutputLossTerm": create_egp_ref(genn_pop, "RingOutputLossTerm"),
+                        "YTrue": create_egp_ref(genn_pop, "YTrue")}
+        else:
+            update_code = f"""
+                const int ringOffset = (batch * num_neurons * {2 * T}) + (id * {2 * T});
+                RingOutputLossTerm[ringOffset + RingWriteOffset]= exp(Val - MaxVal) / SumExpVal;
+                RingWriteOffset++;
+                """
+            egp_refs = [("RingOutputLossTerm", "scalar*")]
+            egp_vals = {"RingOutputLossTerm": create_egp_ref(genn_pop, "RingOutputLossTerm")}
+
         softmax_3 = CustomUpdateModel(
             {
                 "var_refs": [("Val", "scalar", VarAccessMode.READ_ONLY),
                              ("MaxVal", "scalar", VarAccessMode.READ_ONLY),
                              ("SumExpVal", "scalar", VarAccessMode.READ_ONLY),
                              ("RingWriteOffset", "int")],
-                "extra_global_param_refs": [("RingOutputLossTerm", "scalar*")],
-                "update_code": f"""
-                const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
-                RingOutputLossTerm[ringOffset + RingWriteOffset]= exp(Val - MaxVal) / SumExpVal;
-                RingWriteOffset++;
-                """}, 
+                "extra_global_param_refs": egp_refs,
+                "update_code": update_code},
             {}, {},
             {"Val": create_var_ref(genn_pop, input_var_name),
              "MaxVal": create_var_ref(genn_softmax_1, "MaxVal"),
              "SumExpVal": create_var_ref(genn_softmax_2, "SumExpVal"),
              "RingWriteOffset": create_var_ref(genn_pop, "RingWriteOffset")},
             {},
-            {"RingOutputLossTerm": create_egp_ref(genn_pop, "RingOutputLossTerm")})
+            egp_vals)
 
         self.add_custom_update(
-            genn_model, softmax_3, 
-            "Softmax3", 
-            "CUSoftmax3" + genn_pop.name)
-
-    
+            genn_model, softmax_3,
+            "Softmax3",
+            "CUSoftmax3" + genn_pop.name)  
     def _create_optimiser_custom_update(self, name_suffix, var_ref, 
                                         gradient_ref, optimiser, genn_model,
                                         clamp_var=None):

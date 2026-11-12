@@ -6,10 +6,11 @@ from .mean_square_error import MeanSquareError
 from .loss import Loss
 from .relative_mean_square_error import RelativeMeanSquareError
 from .sparse_categorical_crossentropy import SparseCategoricalCrossentropy
+from .Fixaction_MSE_Response_CE import FixationMSEResponseCE
 
 from ..utils.module import get_module_classes
 
 default_losses = get_module_classes(globals(), Loss)
 
 __all__ = ["MeanSquareError", "Loss", "RelativeMeanSquareError",
-           "SparseCategoricalCrossentropy", "default_losses"]
+           "SparseCategoricalCrossentropy", "default_losses", "FixationMSEResponseCE"]
