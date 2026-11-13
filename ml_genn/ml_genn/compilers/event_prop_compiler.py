@@ -732,6 +732,29 @@ class EventPropCompiler(Compiler):
                             raise NotImplementedError(
                                 f"EventProp compiler with CategoricalCrossEntropy loss doesn't support "
                                 f"{type(pop.neuron.readout).__name__} readouts")
+                        
+                    elif combined_loss:
+                        # Backward pass: read back the error saved in the forward pass
+                        print("HERE!!!!!!!!!!!")
+                        if isinstance(pop.neuron.readout, Var):
+                            model_copy.prepend_sim_code(
+                                f"""
+                                const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
+                                if (Trial > 0) {{
+                                    RingReadOffset--;
+                                    const scalar error = RingOutputLossTerm[ringOffset + RingReadOffset];
+                                    drive = error / (TauM * num_batch * {self.dt * self.example_timesteps});
+                                }}
+                                """)
+                            compile_state.add_neuron_reset_vars(
+                                pop, reset_vars, False, True)
+                            compile_state.timestep_softmax_populations.append(
+                                (pop, "V", True))
+                        else:
+                            raise NotImplementedError(
+                                "EventProp compiler with FixationMSEResponseCE "
+                                "loss only supports 'Var' readouts")
+
                     elif mse_loss:
                         # Readout has to be Var
                         if isinstance(pop.neuron.readout, Var):
@@ -1443,9 +1466,10 @@ class EventPropCompiler(Compiler):
                                             i, o, "Batch")
 
         # Add per-timestep softmax custom updates for each population that requires them
-        for p, i, combined in enumerate(compile_state.timestep_softmax_populations):
+        for p, i, combined in compile_state.timestep_softmax_populations:
             # Create custom update model to implement 
             # first softmax pass and add to model
+            print(i)
             genn_pop = neuron_populations[p]
             self._add_softmax_buffer_custom_updates(genn_model, genn_pop, i, combined, int(np.prod(p.shape)))
 
@@ -1576,9 +1600,12 @@ class EventPropCompiler(Compiler):
     def _add_softmax_buffer_custom_updates(self, genn_model, genn_pop,
                                            input_var_name: str,
                                            combined: bool = False,
-                                           n_out: int = 0):
+                                           n_out: int = 0,
+                                           temperature: float = 1.0):
         # Create custom update model to implement
         # first softmax pass and add to model
+        print("Combined: ", combined)
+        print("N_out: ", n_out)
         softmax_1 = CustomUpdateModel(
             softmax_1_model, {}, {"MaxVal": 0.0},
             {"Val": create_var_ref(genn_pop, input_var_name)})
@@ -1591,7 +1618,7 @@ class EventPropCompiler(Compiler):
         # Create custom update model to implement
         # second softmax pass and add to model
         softmax_2 = CustomUpdateModel(
-            softmax_2_model, {}, {"SumExpVal": 0.0},
+            softmax_2_model, {"Temp": temperature}, {"SumExpVal": 0.0},
             {"Val": create_var_ref(genn_pop, input_var_name),
              "MaxVal": create_var_ref(genn_softmax_1, "MaxVal")})
 
