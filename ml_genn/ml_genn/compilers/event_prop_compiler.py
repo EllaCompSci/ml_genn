@@ -4,7 +4,7 @@ import sympy
 
 from abc import ABC
 from string import Template
-from typing import Mapping, Sequence, Set, Union, Tuple
+from typing import Mapping, Sequence, Set, Union, Tuple, List
 from pygenn import (CustomUpdateVarAccess, SynapseMatrixType,
                     SynapseMatrixWeight, VarAccess, VarAccessMode)
 
@@ -21,7 +21,7 @@ from ..communicators import Communicator
 from ..connection import Connection
 from ..connectivity_optimisers import ConnectivityOptimiser, DeepR
 from ..losses import (Loss, MeanSquareError, PerNeuronMeanSquareError,
-                      RelativeMeanSquareError, SparseCategoricalCrossentropy)
+                      RelativeMeanSquareError, SparseCategoricalCrossentropy, MeanSquareErrorCrossEntropy)
 from ..neurons import Input
 from ..optimisers import Optimiser
 from ..readouts import (AvgVar, AvgVarExpWeight, FirstSpikeTime,
@@ -97,6 +97,12 @@ logger = logging.getLogger(__name__)
 # **NOTE** due to the inprecision of ASCII diagramming there are out-by-one errors in the above
 
 # Basic weight-update model for connections without delay
+
+
+
+
+
+
 weight_update_model = {
     "params": [("weight", "scalar")], 
     "pre_neuron_var_refs": [("BackSpike_pre", "uint8_t")],
@@ -658,7 +664,7 @@ class EventPropCompiler(Compiler):
                  strict_buffer_checking: bool = False,
                  per_timestep_loss: bool = False, dt: float = 1.0,
                  ttfs_alpha: float = 0.01, softmax_temperature: float = 1.0,
-                 batch_size: int = 1, rng_seed: int = 0, kernel_profiling: bool = False, 
+                 batch_size: int = 1, loss_time_frame: int = 0, readout_vars: List = [], rng_seed: int = 0, kernel_profiling: bool = False, 
                  communicator: Communicator = None, **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.TOEPLITZ,
                                   SynapseMatrixType.PROCEDURAL_KERNELG,
@@ -699,6 +705,7 @@ class EventPropCompiler(Compiler):
         self.per_timestep_loss = per_timestep_loss
         self.ttfs_alpha = ttfs_alpha
         self.softmax_temperature = softmax_temperature
+        self.loss_time_frame = loss_time_frame
         
 
     def pre_compile(self, network: Network, 
@@ -1270,9 +1277,8 @@ class EventPropCompiler(Compiler):
                                             i, o, "Batch")
 
         # Add per-timestep softmax custom updates for each population that requires them
-        for p, i in enumerate(compile_state.timestep_softmax_populations):
-            # Create custom update model to implement 
-            # first softmax pass and add to model
+        for p, i, *rest in compile_state.timestep_softmax_populations:
+            hybrid = rest[0] if rest else False
             genn_pop = neuron_populations[p]
             self._add_softmax_buffer_custom_updates(genn_model, genn_pop, i)
 
@@ -1400,6 +1406,7 @@ class EventPropCompiler(Compiler):
                                            input_var_name: str):
         # Create custom update model to implement 
         # first softmax pass and add to model
+        T = self.example_timesteps
         softmax_1 = CustomUpdateModel(
             softmax_1_model, {}, {"MaxVal": 0.0},
             {"Val": create_var_ref(genn_pop, input_var_name)})
@@ -1412,9 +1419,9 @@ class EventPropCompiler(Compiler):
         # Create custom update model to implement 
         # second softmax pass and add to model
         softmax_2 = CustomUpdateModel(
-            softmax_2_model, {}, {"SumExpVal": 0.0},
+            softmax_2_model, {"Temp": 1.0}, {"SumExpVal": 0.0},
             {"Val": create_var_ref(genn_pop, input_var_name),
-             "MaxVal": create_var_ref(genn_softmax_1, "MaxVal")})
+            "MaxVal": create_var_ref(genn_softmax_1, "MaxVal")})
 
         genn_softmax_2 = self.add_custom_update(
             genn_model, softmax_2, 
@@ -1423,23 +1430,38 @@ class EventPropCompiler(Compiler):
 
         # Create custom update model to implement 
         # third softmax pass and add to model
+        
         softmax_3 = CustomUpdateModel(
             {
                 "var_refs": [("Val", "scalar", VarAccessMode.READ_ONLY),
-                             ("MaxVal", "scalar", VarAccessMode.READ_ONLY),
-                             ("SumExpVal", "scalar", VarAccessMode.READ_ONLY),
-                             ("RingWriteOffset", "int")],
+                            ("MaxVal", "scalar", VarAccessMode.READ_ONLY),
+                            ("SumExpVal", "scalar", VarAccessMode.READ_ONLY),
+                            ("Target", "scalar", VarAccessMode.READ_ONLY),
+                            ("RowSum", "scalar", VarAccessMode.READ_ONLY),
+                            ("Phase", "scalar", VarAccessMode.READ_ONLY),
+                            ("tsRingWriteOffset", "int")],
                 "extra_global_param_refs": [("RingOutputLossTerm", "scalar*")],
                 "update_code": f"""
                 const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
-                RingOutputLossTerm[ringOffset + RingWriteOffset]= exp(Val - MaxVal) / SumExpVal;
-                RingWriteOffset++;
-                """}, 
+                const scalar softmax = exp(Val - MaxVal) / SumExpVal;
+                scalar g = 0.0;
+                if (Phase > 1.5) {{            // response: weighted cross-entropy
+                    g = Target - (RowSum * softmax);
+                }}
+                else if (Phase > 0.5) {{       // fixation: MSE towards 0
+                    g = -Val;
+                }}
+                RingOutputLossTerm[ringOffset + tsRingWriteOffset] = g;
+                tsRingWriteOffset++;
+                """},
             {}, {},
             {"Val": create_var_ref(genn_pop, input_var_name),
-             "MaxVal": create_var_ref(genn_softmax_1, "MaxVal"),
-             "SumExpVal": create_var_ref(genn_softmax_2, "SumExpVal"),
-             "RingWriteOffset": create_var_ref(genn_pop, "RingWriteOffset")},
+            "MaxVal": create_var_ref(genn_softmax_1, "MaxVal"),
+            "SumExpVal": create_var_ref(genn_softmax_2, "SumExpVal"),
+            "Target": create_var_ref(genn_pop, "Target"),
+            "RowSum": create_var_ref(genn_pop, "RowSum"),
+            "Phase": create_var_ref(genn_pop, "Phase"),
+            "tsRingWriteOffset": create_var_ref(genn_pop, "tsRingWriteOffset")},
             {},
             {"RingOutputLossTerm": create_egp_ref(genn_pop, "RingOutputLossTerm")})
 
@@ -1993,6 +2015,8 @@ class EventPropCompiler(Compiler):
         mse_loss = isinstance(pop_loss, MeanSquareError)
         per_neuron_mse_loss = isinstance(pop_loss, PerNeuronMeanSquareError)
         rmse_loss = isinstance(pop_loss, RelativeMeanSquareError)
+        mse_sce_loss = isinstance(pop_loss, MeanSquareErrorCrossEntropy)
+
         
         # If we should record loss
         if pop_loss.record_key is not None:
@@ -2022,9 +2046,69 @@ class EventPropCompiler(Compiler):
             assert len(saved_vars_spike) == 0
             assert len(adjoint_jumps) == 0
 
+            
+
             # If we want to calculate mean-squared error or per-timestep loss
             out_var_name = model.output_var_name
-            if self.per_timestep_loss or mse_loss:
+
+            if mse_sce_loss:
+                assert isinstance(pop.neuron.readout, AvgVarExpWeight)
+                ro = pop.neuron.readout
+                T = self.example_timesteps
+
+                # (i) MSE initialisation: per-timestep error ring
+                if not dyn_ts_reset_needed:
+                    genn_model.add_var("tsRingWriteOffset", "int", 0, reset=False)
+                    genn_model.add_var("tsRingReadOffset", "int", 0, reset=False)
+                ring_size = self.batch_size * np.prod(pop.shape) * 2 * T
+                genn_model.add_egp("RingOutputLossTerm", "scalar*",
+                                np.empty(ring_size, dtype=np.float32))
+                reset_v_ring = True
+
+                # (i) softmax initialisation
+                genn_model.add_var("Softmax", "scalar", 0.0,
+                                VarAccess.READ_ONLY_DUPLICATE, reset=False)
+
+                # (iii) AvgVarExpWeight SCE drive (note +=, added on top of the MSE drive)
+                local_t_scale = 1.0 / (window_end - window_start)
+                sce_code = f"""
+                    if(id == YTrueBack) {{
+                        drive += ((1.0 - Softmax) * exp(-(1.0 - (t * {local_t_scale})))) / (num_batch * {window_end - window_start});
+                    }}
+                    else {{
+                        drive += -Softmax * exp(-(1.0 - (t * {local_t_scale}))) / (num_batch * {window_end - window_start});
+                    }}
+                """
+
+                # Backward: (ii) MSE-to-zero from the ring + (iii) windowed SCE
+                genn_model.prepend_sim_code(
+                    f"""
+                    // Backward pass
+                    scalar drive = 0.0;
+                    const int tsRingOffset = (batch * num_neurons * {2 * T}) + (id * {2 * T});
+                    tsRingReadOffset--;
+                    if (Trial > 0) {{
+                        const scalar error = RingOutputLossTerm[tsRingOffset + tsRingReadOffset];
+                        drive = {pop_loss.fixation_weight} * error / (num_batch * {T * self.dt});
+                        {ro.back_windowed_readout_code(sce_code, T, self.dt)}
+                    }}
+                    {dynamics_code}
+                    """)
+
+                # Forward (ii): error = 0 - V during fixation, 0 otherwise; write every step
+                genn_model.append_sim_code(
+                    f"""
+                    const unsigned int timestep = (int)round(t / dt);
+                    RingOutputLossTerm[tsRingOffset + tsRingWriteOffset] =
+                        (Fixation[(batch * {T}) + timestep] != 0) ? (0.0 - {out_var_name}) : 0.0;
+                    tsRingWriteOffset++;
+                    """)
+
+                compile_state.batch_softmax_populations.append(
+                    (pop, out_var_name + "Avg", "Softmax"))
+
+    
+            elif self.per_timestep_loss or mse_loss:
                 # Add variables to hold offsets for 
                 # reading and writing ring variables if not yet done for dynamics
                 if not dyn_ts_reset_needed:
@@ -2106,6 +2190,7 @@ class EventPropCompiler(Compiler):
                         RingOutputLossTerm[tsRingOffset + tsRingWriteOffset] = YTrue[index] - {out_var_name};
                         tsRingWriteOffset++;
                         """) 
+                                
             # Otherwise, we want to calculate loss over each trial
             else:
                 if sce_loss:
